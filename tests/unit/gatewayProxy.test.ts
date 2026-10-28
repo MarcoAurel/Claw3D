@@ -30,6 +30,7 @@ const closeWebSocket = (ws: WebSocket) =>
 describe("createGatewayProxy", () => {
   afterEach(() => {
     vi.restoreAllMocks();
+    vi.unstubAllEnvs();
   });
 
   it("injects gateway token into connect request", async () => {
@@ -790,6 +791,93 @@ describe("createGatewayProxy", () => {
         closeHttpServer(proxyHttp),
       ]);
     }
+  });
+
+  const connectAndReadUpstreamForwardedFor = async (
+    browserHeaders: Record<string, string> = {}
+  ) => {
+    const upstream = new WebSocketServer({ port: 0 });
+    const address = upstream.address();
+    if (!address || typeof address === "string") {
+      throw new Error("expected upstream server to have a port");
+    }
+    const upstreamUrl = `ws://127.0.0.1:${address.port}`;
+
+    let seenForwardedFor: string | undefined;
+    upstream.on("connection", (ws, req) => {
+      seenForwardedFor = req.headers["x-forwarded-for"] as string | undefined;
+      ws.on("message", (raw) => {
+        const parsed = JSON.parse(String(raw));
+        if (parsed?.method === "connect") {
+          ws.send(
+            JSON.stringify({
+              type: "res",
+              id: parsed.id,
+              ok: true,
+              payload: { type: "hello-ok", protocol: 3, auth: {} },
+            })
+          );
+        }
+      });
+    });
+
+    const { createGatewayProxy } = await import("../../server/gateway-proxy");
+
+    const proxyHttp = await import("node:http").then((m) => m.createServer());
+    const proxy = createGatewayProxy({
+      loadUpstreamSettings: async () => ({ url: upstreamUrl, token: "host-token-456" }),
+      allowWs: (req: { url?: string }) => req.url === "/api/gateway/ws",
+      logError: () => {},
+    });
+    proxyHttp.on("upgrade", (req, socket, head) => proxy.handleUpgrade(req, socket, head));
+
+    await new Promise<void>((resolve) => proxyHttp.listen(0, "127.0.0.1", resolve));
+    const proxyAddr = proxyHttp.address();
+    if (!proxyAddr || typeof proxyAddr === "string") {
+      throw new Error("expected proxy server to have a port");
+    }
+
+    const browser = new WebSocket(`ws://127.0.0.1:${proxyAddr.port}/api/gateway/ws`, {
+      headers: browserHeaders,
+    });
+    try {
+      await waitForEvent(browser, "open");
+      browser.send(
+        JSON.stringify({ type: "req", id: "connect-xff", method: "connect", params: { auth: {} } })
+      );
+      await waitForEvent(browser, "message");
+      return seenForwardedFor;
+    } finally {
+      for (const client of upstream.clients) {
+        client.close();
+      }
+      await Promise.all([
+        closeWebSocket(browser),
+        closeWebSocketServer(upstream),
+        closeHttpServer(proxyHttp),
+      ]);
+    }
+  };
+
+  it("does not send X-Forwarded-For upstream by default", async () => {
+    vi.stubEnv("TRUSTED_PROXY", "1");
+    const seen = await connectAndReadUpstreamForwardedFor({ "x-forwarded-for": "203.0.113.7" });
+    expect(seen).toBeUndefined();
+  });
+
+  it("sends the browser address upstream when CLAW3D_GATEWAY_FORWARD_CLIENT_IP=1 and TRUSTED_PROXY=1", async () => {
+    vi.stubEnv("CLAW3D_GATEWAY_FORWARD_CLIENT_IP", "1");
+    vi.stubEnv("TRUSTED_PROXY", "1");
+    const seen = await connectAndReadUpstreamForwardedFor({
+      "x-forwarded-for": "203.0.113.7, 10.11.0.9",
+    });
+    expect(seen).toBe("203.0.113.7");
+  });
+
+  it("falls back to the direct peer address and ignores X-Forwarded-For without TRUSTED_PROXY", async () => {
+    vi.stubEnv("CLAW3D_GATEWAY_FORWARD_CLIENT_IP", "1");
+    const seen = await connectAndReadUpstreamForwardedFor({ "x-forwarded-for": "203.0.113.7" });
+    expect(seen).toBe("127.0.0.1");
   });
 
   it("still rate limits abusive bursts that exceed the token bucket", async () => {

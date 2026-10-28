@@ -1,4 +1,5 @@
 const { Buffer } = require("node:buffer");
+const net = require("node:net");
 const { WebSocket, WebSocketServer } = require("ws");
 
 const DEFAULT_UPSTREAM_HANDSHAKE_TIMEOUT_MS = 10_000;
@@ -107,6 +108,30 @@ const isUpstreamAllowed = (url) => {
   }
 };
 
+/**
+ * Client address to advertise to the upstream gateway as X-Forwarded-For.
+ * Opt-in via CLAW3D_GATEWAY_FORWARD_CLIENT_IP=1. Some gateways (e.g. OpenClaw
+ * behind a container overlay network) see this proxy as a trusted proxy and
+ * reject connections that do not identify the original client. Off by default:
+ * forwarded headers on a loopback connection make some gateways stop treating
+ * it as local.
+ * The browser address is read from X-Forwarded-For only when TRUSTED_PROXY=1,
+ * like the access gate; otherwise the direct peer address is used.
+ */
+const resolveForwardedClientIp = (req) => {
+  if (process.env.CLAW3D_GATEWAY_FORWARD_CLIENT_IP !== "1") return "";
+  let ip = "";
+  if (process.env.TRUSTED_PROXY === "1") {
+    const forwarded = req?.headers?.["x-forwarded-for"];
+    if (typeof forwarded === "string") {
+      ip = forwarded.split(",")[0]?.trim() ?? "";
+    }
+  }
+  if (!ip) ip = req?.socket?.remoteAddress ?? "";
+  ip = ip.replace(/^::ffff:/i, "");
+  return net.isIP(ip) ? ip : "";
+};
+
 const resolvePathname = (url) => {
   const raw = typeof url === "string" ? url : "";
   const idx = raw.indexOf("?");
@@ -184,7 +209,8 @@ function createGatewayProxy(options) {
 
   const wss = new WebSocketServer({ noServer: true, verifyClient });
 
-  wss.on("connection", (browserWs) => {
+  wss.on("connection", (browserWs, req) => {
+    const forwardedClientIp = resolveForwardedClientIp(req);
     let upstreamWs = null;
     let upstreamReady = false;
     let upstreamUrl = "";
@@ -333,6 +359,7 @@ function createGatewayProxy(options) {
       upstreamWs = new WebSocket(upstreamUrl, {
         origin: upstreamOrigin,
         handshakeTimeout: upstreamHandshakeTimeoutMs,
+        ...(forwardedClientIp ? { headers: { "X-Forwarded-For": forwardedClientIp } } : {}),
       });
 
       upstreamHandshakeTimeoutId = setTimeout(() => {
